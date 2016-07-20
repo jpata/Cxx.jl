@@ -56,7 +56,7 @@ end
 cpptype{T,jlt}(C,p::Type{JLCppCast{T,jlt}}) = pointerTo(C,cpptype(C,T))
 
 macro jpcpp_str(s,args...)
-    JLCppCast{CppBaseType{symbol(s)}}
+    JLCppCast{CppBaseType{Symbol(s)}}
 end
 
 # Represents a forced cast form the value T
@@ -126,6 +126,8 @@ resolvemodifier{T}(C,p::Type{CppAddr{T}}, e::pcpp"clang::Expr") =
 # same in julia and Clang
 resolvemodifier_llvm{ptr}(C, builder, t::Type{Ptr{ptr}}, v::pcpp"llvm::Value") = v
 resolvemodifier_llvm{T<:Ref}(C, builder, t::Type{T}, v::pcpp"llvm::Value") = v
+resolvemodifier_llvm(C, builder, t::Type{Bool}, v::pcpp"llvm::Value") =
+    CreateTrunc(builder, v, toLLVM(C, cpptype(C, Bool)))
 resolvemodifier_llvm(C, builder, t::CxxBuiltinTypes, v::pcpp"llvm::Value") = v
 
 resolvemodifier_llvm{T}(C, builder, t::Type{T}, v::pcpp"llvm::Value") = v
@@ -133,11 +135,8 @@ resolvemodifier_llvm{T}(C, builder, t::Type{T}, v::pcpp"llvm::Value") = v
 
 function resolvemodifier_llvm{T,CVR}(C, builder,
     t::Type{CppRef{T,CVR}}, v::pcpp"llvm::Value")
-    # CppRef is a julia immutable with one field, so at the LLVM
-    # level they are represented as LLVM structrs with one (pointer) field.
-    # To get at the pointer itself, we simply need to emit an extract
-    # instruction
-    ExtractValue(C,v,0)
+    ty = cpptype(C, t)
+    IntToPtr(builder,v,toLLVM(C,ty))
 end
 
 function resolvemodifier_llvm{T,CVR}(C, builder, t::Type{CppPtr{T, CVR}}, v::pcpp"llvm::Value")
@@ -193,7 +192,7 @@ function resolvemodifier_llvm{T,jlt}(C, builder,
 end
 
 # This used to be a lot more complicated before the pointer and tuple reworks
-# Luckily for us, not it's just:
+# Luckily for us, now it's just:
 #
 #    +-----------------+
 #    |   CppValue      |
@@ -544,7 +543,8 @@ function emitRefExpr(C, expr, pvd = nothing, ct = nothing)
         ret = C_NULL
     end
 
-    createReturn(C,builder,f,argt,argt,llvmrt,rett,rt,ret,state)
+    createReturn(C,builder,f,argt,argt,llvmrt,rett,rt,ret,state;
+        argidxs=pvd == nothing ? [] : [1])
 end
 
 #
@@ -582,7 +582,7 @@ function _cppcall(CT, expr, thiscall, isnew, argt)
         else
             decl = declfornns(C,expr)
             @assert decl != C_NULL
-            fname = symbol(getName(pcpp"clang::NamedDecl"(convert(Ptr{Void},decl))))
+            fname = Symbol(getName(pcpp"clang::NamedDecl"(convert(Ptr{Void},decl))))
         end
         @assert isa(fname,Symbol)
 
@@ -624,7 +624,7 @@ function _cppcall(CT, expr, thiscall, isnew, argt)
             else
                 cxxd = dcastCXXRecordDecl(d)
             end
-            fname = symbol(_decl_name(d))
+            fname = Symbol(_decl_name(d))
             cxxt = cxxtmplt(d)
             if cxxd != C_NULL || cxxt != C_NULL
                 if cxxd == C_NULL
@@ -670,10 +670,12 @@ end
 
 function CreateFunctionWithPersonality(C, args...)
     f = CreateFunction(C, args...)
-    PersonalityF = pcpp"llvm::Function"(convert(Ptr{Void},GetAddrOfFunction(C,
-        lookup_name(C,["__cxxjl_personality_v0"]))))
-    @assert PersonalityF != C_NULL
-    setPersonality(f, PersonalityF)
+    if !isCCompiler(C)
+        PersonalityF = pcpp"llvm::Function"(convert(Ptr{Void},GetAddrOfFunction(C,
+            lookup_name(C,["__cxxjl_personality_v0"]))))
+        @assert PersonalityF != C_NULL
+        setPersonality(f, PersonalityF)
+    end
     f
 end
 
@@ -761,12 +763,12 @@ function createReturn(C,builder,f,argt,llvmargt,llvmrt,rett,rt,ret,state; argidx
         if rett == Void || isVoidTy(llvmrt)
             CreateRetVoid(builder)
         else
-            if rett <: CppRef || rett <: CppEnum || rett <: CppFptr
+            if  rett <: CppEnum || rett <: CppFptr
                 undef = getUndefValue(llvmrt)
                 elty = getStructElementType(llvmrt,0)
                 ret = CreateBitCast(builder,ret,elty)
                 ret = InsertValue(builder, undef, ret, 0)
-            elseif rett <: CppPtr
+            elseif rett <: CppRef || rett <: CppPtr
                 ret = PtrToInt(builder, ret, llvmrt)
             elseif rett <: CppMFptr
                 undef = getUndefValue(llvmrt)
@@ -774,6 +776,8 @@ function createReturn(C,builder,f,argt,llvmargt,llvmrt,rett,rt,ret,state; argidx
                         ExtractValue(C,ret,0),getStructElementType(llvmrt,0)),0)
                 ret = InsertValue(builder,i1,CreateBitCast(builder,
                         ExtractValue(C,ret,1),getStructElementType(llvmrt,1)),1)
+            elseif rett == Bool
+                ret = CreateZext(builder,ret,julia_to_llvm(rett))
             else
                 ret = CreateBitCast(builder,ret,julia_to_llvm(rett))
             end

@@ -46,6 +46,7 @@
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Basic/TargetInfo.h"
+#include "clang/Lex/PreprocessorOptions.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Parse/ParseAST.h"
@@ -65,6 +66,7 @@
 #include <clang/AST/ASTContext.h>
 #include <clang/AST/DeclTemplate.h>
 #include <clang/Basic/Specifiers.h>
+#include <clang/CodeGen/CGFunctionInfo.h>
 
 #include "Parse/RAIIObjectsForParser.h"
 #include "CodeGen/CodeGenModule.h"
@@ -74,11 +76,26 @@
 #undef private
 #include "CodeGen/CGCXXABI.h"
 
-#include "dtypes.h"
-#include "platform.h"
+#ifdef _OS_WINDOWS_
+#define STDCALL __stdcall
+# ifdef LIBRARY_EXPORTS
+#  define JL_DLLEXPORT __declspec(dllexport)
+# else
+#  define JL_DLLEXPORT __declspec(dllimport)
+# endif
+#else
+#define STDCALL
+#define JL_DLLEXPORT __attribute__ ((visibility("default")))
+#endif
 
 #if defined(LLVM_VERSION_MAJOR) && LLVM_VERSION_MAJOR == 3 && LLVM_VERSION_MINOR >= 6
 #define LLVM36 1
+#endif
+#if defined(LLVM_VERSION_MAJOR) && LLVM_VERSION_MAJOR == 3 && LLVM_VERSION_MINOR >= 8
+#define LLVM38 1
+#endif
+#if defined(LLVM_VERSION_MAJOR) && LLVM_VERSION_MAJOR == 3 && LLVM_VERSION_MINOR >= 9
+#define LLVM39 1
 #endif
 
 #ifndef OLD_NDEBUG
@@ -87,9 +104,12 @@
 
 // From julia
 using namespace llvm;
+#ifdef LLVM39
+extern llvm::LLVMContext jl_LLVMContext;
+#else
 extern llvm::LLVMContext &jl_LLVMContext;
+#endif
 static llvm::Type *T_pvalue_llvmt;
-
 
 class JuliaCodeGenerator;
 
@@ -161,6 +181,13 @@ JL_DLLEXPORT void add_directory(C, int kind, int isFramework, const char *dirnam
     std::cout << "WARNING: Could not add directory " << dirname << " to clang search path!\n";
   else
     pp.getHeaderSearchInfo().AddSearchPath(clang::DirectoryLookup(dir,flag,isFramework),flag == clang::SrcMgr::C_System || flag == clang::SrcMgr::C_ExternCSystem);
+}
+
+JL_DLLEXPORT int isCCompiler(C)
+{
+    return Cxx->CI->getLangOpts().CPlusPlus == 0 &&
+           Cxx->CI->getLangOpts().ObjC1 == 0 &&
+           Cxx->CI->getLangOpts().ObjC2 == 0;
 }
 
 JL_DLLEXPORT int _cxxparse(C)
@@ -264,6 +291,12 @@ JL_DLLEXPORT int cxxinclude(C, char *fname, int isAngled)
     return _cxxparse(Cxx);
 }
 
+#ifdef LLVM39
+typedef llvm::IRBuilder<> CxxIRBuilder;
+#else
+typedef llvm::IRBuilder<true> CxxIRBuilder;
+#endif
+
 /*
  * Collect all global initializers into one llvm::Function, which
  * we can then call.
@@ -284,7 +317,7 @@ JL_DLLEXPORT llvm::Function *CollectGlobalConstructors(C)
       "",
       Cxx->shadow
       );
-    llvm::IRBuilder<true> builder(BasicBlock::Create(jl_LLVMContext, "top", InitF));
+    CxxIRBuilder builder(BasicBlock::Create(jl_LLVMContext, "top", InitF));
 
     for (auto ctor : ctors) {
         builder.CreateCall(ctor.Initializer, {});
@@ -372,7 +405,10 @@ JL_DLLEXPORT void *lookup_name(C, char *name, clang::DeclContext *ctx)
     cs.RequireCompleteDeclContext(spec,ctx);
     //return dctx->lookup(DName).front();
     clang::LookupResult R(cs, DName, getTrivialSourceLocation(Cxx), clang::Sema::LookupAnyName);
-    cs.LookupQualifiedName(R, ctx, false);
+    if (isa<clang::TranslationUnitDecl>(ctx))
+      cs.LookupName(R, cs.getCurScope(), false);
+    else
+      cs.LookupQualifiedName(R, ctx, false);
     return R.empty() ? NULL : R.getRepresentativeDecl();
 }
 
@@ -405,8 +441,13 @@ JL_DLLEXPORT void *SpecializeClass(C, clang::ClassTemplateDecl *tmplt, void **ty
                             tmplt->getTemplatedDecl()->getLocStart(),
                             tmplt->getLocation(),
                             tmplt,
+#ifndef LLVM39
                             targs,
-                            nargs, nullptr);
+                            nargs,
+#else                      
+                            ArrayRef<clang::TemplateArgument>{targs,nargs},
+#endif
+                            nullptr);
     tmplt->AddSpecialization(ret, InsertPos);
     if (tmplt->isOutOfLine())
       ret->setLexicalDeclContext(tmplt->getLexicalDeclContext());
@@ -519,7 +560,7 @@ static Function *CloneFunctionAndAdjust(C, Function *F, FunctionType *FTy,
 
   // Create the new function...
   Function *NewF = Function::Create(FTy, F->getLinkage(), F->getName(), Cxx->shadow);
-  llvm::IRBuilder<true> builder(jl_LLVMContext);
+  CxxIRBuilder builder(jl_LLVMContext);
 
   CallInst *Call;
   PointerType *T_pint8 = Type::getInt8PtrTy(jl_LLVMContext,0);
@@ -538,7 +579,11 @@ static Function *CloneFunctionAndAdjust(C, Function *F, FunctionType *FTy,
     if (MD && MD->isInstance()) {
       Cxx->CGM->getCXXABI().buildThisParam(*Cxx->CGF, Args);
     }
+#ifdef LLVM39
+    for (auto *PVD : FD->parameters()) {
+#else
     for (auto *PVD : FD->params()) {
+#endif
       Args.push_back(PVD);
     }
     size_t n_roots = 0;
@@ -714,6 +759,49 @@ static Function *CloneFunctionAndAdjust(C, Function *F, FunctionType *FTy,
   return NewF;
 }
 
+JL_DLLEXPORT void *DeleteUnusedArguments(llvm::Function *F, uint64_t *dtodelete, size_t ntodelete)
+{
+  FunctionType *FTy = F->getFunctionType();
+  std::vector<Type*> Params(FTy->param_begin(), FTy->param_end());
+  std::vector<uint64_t> todelete;
+  todelete.insert(todelete.end(), dtodelete, dtodelete+ntodelete);
+  std::sort(todelete.begin(), todelete.end());
+  // Delete from back to front to avoid invalidating indices
+  for (auto i = todelete.rbegin(); i != todelete.rend(); ++i)
+    Params.erase(Params.begin() + *i);
+  FunctionType *NFTy = FunctionType::get(FTy->getReturnType(),
+                                                Params, false);
+  Function *NF = Function::Create(NFTy, F->getLinkage());
+  NF->copyAttributesFrom(F);
+#ifdef LLVM38
+  F->getParent()->getFunctionList().insert(F->getIterator(), NF);
+#else
+  F->getParent()->getFunctionList().insert(F, NF);
+#endif
+  NF->takeName(F);
+
+  NF->getBasicBlockList().splice(NF->begin(), F->getBasicBlockList());
+
+  auto x = todelete.begin();
+  size_t i = 0;
+  for (Function::arg_iterator I = F->arg_begin(), E = F->arg_end(),
+       I2 = NF->arg_begin(); I != E; ++i, ++I) {
+    if (*x == i) {
+      I->replaceAllUsesWith(UndefValue::get(I->getType()));
+      ++x;
+      continue;
+    }
+    // Move the name and users over to the new version.
+    I->replaceAllUsesWith(&*I2);
+    I2->takeName(&*I);
+    ++I2;
+  }
+
+  F->eraseFromParent();
+
+  return NF;
+}
+
 
 JL_DLLEXPORT void ReplaceFunctionForDecl(C,clang::FunctionDecl *D, llvm::Function *F, bool DoInline, bool specsig, bool firstIsEnv, bool *needsbox, void **juliatypes)
 {
@@ -813,7 +901,11 @@ JL_DLLEXPORT bool ParseFunctionStatementBody(C, clang::Decl *D)
       }
     }
     if (last && isa<clang::Expr>(last)) {
-      clang::StmtResult RetStmt(sema.BuildReturnStmt(getTrivialSourceLocation(Cxx), cast<clang::Expr>(last)));
+      clang::Expr *RetExpr = cast<clang::Expr>(last);
+      clang::SourceLocation ReturnLoc = getTrivialSourceLocation(Cxx);
+      sema.DeduceFunctionTypeFromReturnExpr(cast<clang::FunctionDecl>(D), ReturnLoc, RetExpr,
+            cast<clang::FunctionDecl>(D)->getReturnType()->getContainedAutoType());
+      clang::StmtResult RetStmt(sema.BuildReturnStmt(ReturnLoc, RetExpr));
       if (!RetStmt.isUsable()) {
         sema.ActOnFinishFunctionBody(D, nullptr);
         return false;
@@ -831,6 +923,9 @@ JL_DLLEXPORT void *ActOnStartNamespaceDef(C, char *name)
 {
   Cxx->Parser->EnterScope(clang::Scope::DeclScope);
   clang::ParsedAttributes attrs(Cxx->Parser->getAttrFactory());
+#ifdef LLVM38
+  clang::UsingDirectiveDecl *UsingDecl = nullptr;
+#endif
   return Cxx->CI->getSema().ActOnStartNamespaceDef(
       Cxx->Parser->getCurScope(),
       getTrivialSourceLocation(Cxx),
@@ -839,7 +934,10 @@ JL_DLLEXPORT void *ActOnStartNamespaceDef(C, char *name)
       Cxx->Parser->getPreprocessor().getIdentifierInfo(name),
       getTrivialSourceLocation(Cxx),
       attrs.getList()
-      );
+#ifdef LLVM38
+      ,UsingDecl
+#endif
+    );
 }
 
 JL_DLLEXPORT void ActOnFinishNamespaceDef(C, clang::Decl *D)
@@ -1158,12 +1256,12 @@ public:
   JuliaPCHGenerator(
     const clang::Preprocessor &PP, StringRef OutputFile,
     clang::Module *Module, StringRef isysroot,
-    std::shared_ptr<clang::PCHBuffer> Buffer,
+    std::shared_ptr<clang::PCHBuffer> Buffer
 #ifdef LLVM38
-    ArrayRef<llvm::IntrusiveRefCntPtr<clang::ModuleFileExtension>> Extensions,
+    ,ArrayRef<llvm::IntrusiveRefCntPtr<clang::ModuleFileExtension>> Extensions,
     bool IncludeTimestamps = true
 #endif
-    bool AllowASTWithErrors = false) :
+    ,bool AllowASTWithErrors = false) :
   PCHGenerator(PP,OutputFile,Module,isysroot,Buffer,
 #ifdef LLVM38
                Extensions,
@@ -1187,52 +1285,86 @@ public:
 extern "C" {
 
 
-JL_DLLEXPORT void init_clang_instance(C, const char *Triple, const char *SysRoot, bool EmitPCH,
-  const char *UsePCH, Type *_T_pvalue_llvmt) {
+static void set_common_options(C)
+{
+  Cxx->CI->getDiagnosticOpts().ShowColors = 1;
+  Cxx->CI->getDiagnosticOpts().ShowPresumedLoc = 1;
+  Cxx->CI->createDiagnostics();
+  Cxx->CI->getCodeGenOpts().setDebugInfo(
+#ifdef LLVM39
+    clang::codegenoptions::NoDebugInfo
+#else
+    clang::CodeGenOptions::NoDebugInfo
+#endif
+  );
+}
+
+static void set_default_clang_options(C, bool CCompiler, const char *Triple, const char *CPU, const char *SysRoot, Type *_T_pvalue_llvmt)
+{
     T_pvalue_llvmt = _T_pvalue_llvmt;
 
-    //copied from http://www.ibm.com/developerworks/library/os-createcompilerllvm2/index.html
-    Cxx->CI = new clang::CompilerInstance;
-    Cxx->CI->getDiagnosticOpts().ShowColors = 1;
-    Cxx->CI->getDiagnosticOpts().ShowPresumedLoc = 1;
-    Cxx->CI->createDiagnostics();
-    Cxx->CI->getLangOpts().CPlusPlus = 1;
-    Cxx->CI->getLangOpts().CPlusPlus11 = 1;
-    Cxx->CI->getLangOpts().CPlusPlus14 = 1;
+    llvm::Triple target = llvm::Triple(Triple == NULL ?
+        llvm::Triple::normalize(llvm::sys::getProcessTriple()) : llvm::Triple::normalize(Triple));
+    bool isnvptx = (target.getArch() == Triple::ArchType::nvptx) ||
+                   (target.getArch() == Triple::ArchType::nvptx64);
+
     Cxx->CI->getLangOpts().LineComment = 1;
     Cxx->CI->getLangOpts().Bool = 1;
     Cxx->CI->getLangOpts().WChar = 1;
     Cxx->CI->getLangOpts().C99 = 1;
-    Cxx->CI->getLangOpts().RTTI = 1;
-    Cxx->CI->getLangOpts().RTTIData = 1;
+    if (!CCompiler) {
+        Cxx->CI->getLangOpts().CPlusPlus = 1;
+        Cxx->CI->getLangOpts().CPlusPlus11 = 1;
+        Cxx->CI->getLangOpts().CPlusPlus14 = 1;
+        Cxx->CI->getLangOpts().RTTI = 1;
+        Cxx->CI->getLangOpts().RTTIData = 1;
+        Cxx->CI->getLangOpts().Exceptions = 1;          // exception handling
+        Cxx->CI->getLangOpts().ObjCExceptions = 1;  //  Objective-C exceptions
+        Cxx->CI->getLangOpts().CXXExceptions = 1;   // C++ exceptions
+        Cxx->CI->getLangOpts().CXXOperatorNames = 1;
+        Cxx->CI->getHeaderSearchOpts().UseLibcxx = 1;
+        Cxx->CI->getHeaderSearchOpts().UseStandardSystemIncludes = 1;
+        Cxx->CI->getHeaderSearchOpts().UseStandardCXXIncludes = 1;
+    }
     Cxx->CI->getLangOpts().ImplicitInt = 0;
     Cxx->CI->getLangOpts().PICLevel = 2;
-    Cxx->CI->getLangOpts().Exceptions = 1;          // exception handling
-    Cxx->CI->getLangOpts().ObjCExceptions = 1;  //  Objective-C exceptions
-    Cxx->CI->getLangOpts().CXXExceptions = 1;   // C++ exceptions
+    if (isnvptx) {
+        Cxx->CI->getLangOpts().CUDA = 1;
+        Cxx->CI->getLangOpts().CUDAIsDevice = 1;
+#if defined(LLVM38)
+        Cxx->CI->getLangOpts().DeclSpecKeyword = 1;
+#endif
+#if defined(LLVM38) && !defined(LLVM39)
+        Cxx->CI->getLangOpts().CUDAAllowHostCallsFromHostDevice = 1;
+        Cxx->CI->getLangOpts().CUDATargetOverloads = 1;
+        Cxx->CI->getLangOpts().CUDADisableTargetCallChecks = 1;
+#endif
+    }
 
     // TODO: Decide how we want to handle this
     // clang_compiler->getLangOpts().AccessControl = 0;
     Cxx->CI->getPreprocessorOpts().UsePredefines = 1;
     Cxx->CI->getHeaderSearchOpts().UseBuiltinIncludes = 1;
-    Cxx->CI->getHeaderSearchOpts().UseLibcxx = 1;
-    Cxx->CI->getHeaderSearchOpts().UseStandardSystemIncludes = 1;
-    Cxx->CI->getHeaderSearchOpts().UseStandardCXXIncludes = 1;
     if (SysRoot)
       Cxx->CI->getHeaderSearchOpts().Sysroot = SysRoot;
-    Cxx->CI->getCodeGenOpts().setDebugInfo(clang::CodeGenOptions::NoDebugInfo);
     Cxx->CI->getCodeGenOpts().DwarfVersion = 2;
     Cxx->CI->getCodeGenOpts().StackRealignment = 1;
-    Cxx->CI->getTargetOpts().Triple = Triple == NULL ? llvm::Triple::normalize(llvm::sys::getProcessTriple()) : Triple;
-    Cxx->CI->getTargetOpts().CPU = llvm::sys::getHostCPUName ();
+    Cxx->CI->getTargetOpts().Triple = target.normalize();
+    Cxx->CI->getTargetOpts().CPU = CPU == NULL ? llvm::sys::getHostCPUName() : CPU;
     StringMap< bool > ActiveFeatures;
     std::vector< std::string > Features;
-    if (llvm::sys::getHostCPUFeatures(ActiveFeatures)) {
+    if (isnvptx) {
+      Features.push_back("+ptx42");
+      Cxx->CI->getTargetOpts().Features = Features;
+    } else if (llvm::sys::getHostCPUFeatures(ActiveFeatures)) {
       for (auto &F : ActiveFeatures)
         Features.push_back(std::string(F.second ? "+" : "-") +
                                               std::string(F.first()));
       Cxx->CI->getTargetOpts().Features = Features;
     }
+}
+
+static void finish_clang_init(C, bool EmitPCH, const char *UsePCH) {
     Cxx->CI->setTarget(clang::TargetInfo::CreateTargetInfo(
       Cxx->CI->getDiagnostics(),
       std::make_shared<clang::TargetOptions>(Cxx->CI->getTargetOpts())));
@@ -1242,7 +1374,9 @@ JL_DLLEXPORT void init_clang_instance(C, const char *Triple, const char *SysRoot
     Cxx->CI->createPreprocessor(clang::TU_Prefix);
     Cxx->CI->createASTContext();
     Cxx->shadow = new llvm::Module("clangShadow",jl_LLVMContext);
-#ifdef LLVM38
+#ifdef LLVM39
+    Cxx->shadow->setDataLayout(tin.getDataLayout());
+#elif defined(LLVM38)
     Cxx->shadow->setDataLayout(tin.getDataLayoutString());
 #else
     Cxx->shadow->setDataLayout(tin.getTargetDescription());
@@ -1326,6 +1460,22 @@ JL_DLLEXPORT void init_clang_instance(C, const char *Triple, const char *SysRoot
     f_julia_type_to_llvm = (llvm::Type *(*)(void *, bool *))
       dlsym(RTLD_DEFAULT, "julia_type_to_llvm");
     assert(f_julia_type_to_llvm);
+}
+
+JL_DLLEXPORT void init_clang_instance(C, const char *Triple, const char *CPU, const char *SysRoot, bool EmitPCH,
+  bool CCompiler, const char *UsePCH, Type *_T_pvalue_llvmt) {
+    Cxx->CI = new clang::CompilerInstance;
+    set_common_options(Cxx);
+    set_default_clang_options(Cxx, CCompiler, Triple, CPU, SysRoot, _T_pvalue_llvmt);
+    finish_clang_init(Cxx, EmitPCH, UsePCH);
+}
+
+JL_DLLEXPORT void init_clang_instance_from_invocation(C, clang::CompilerInvocation *Inv)
+{
+    Cxx->CI = new clang::CompilerInstance;
+    Cxx->CI->setInvocation(Inv);
+    set_common_options(Cxx);
+    finish_clang_init(Cxx, false, nullptr);
 }
 
 void decouple_pch(C)
@@ -1435,7 +1585,9 @@ JL_DLLEXPORT void cleanup_cpp_env(C, cppcall_state_t *state)
     // Hack: MaybeBindToTemporary can cause this to be
     // set if the allocated type has a constructor.
     // For now, ignore.
+#ifndef LLVM39
     Cxx->CI->getSema().ExprNeedsCleanups = false;
+#endif
 
     cur_module = state->module;
     cur_func = state->func;
@@ -1499,7 +1651,7 @@ JL_DLLEXPORT void *CreateCxxCallMethodDecl(C, clang::CXXRecordDecl *TheClass, vo
   return Method;
 }
 
-JL_DLLEXPORT void *CreateParmVarDecl(C, void *type, char *name)
+JL_DLLEXPORT void *CreateParmVarDecl(C, void *type, char *name, int used)
 {
     clang::QualType T = clang::QualType::getFromOpaquePtr(type);
     clang::ParmVarDecl *d = clang::ParmVarDecl::Create(
@@ -1511,7 +1663,8 @@ JL_DLLEXPORT void *CreateParmVarDecl(C, void *type, char *name)
         T,
         Cxx->CI->getASTContext().getTrivialTypeSourceInfo(T),
         clang::SC_None,NULL);
-    d->setIsUsed();
+    if (used)
+        d->setIsUsed();
     return (void*)d;
 }
 
@@ -1558,6 +1711,11 @@ JL_DLLEXPORT void AddDeclToDeclCtx(clang::DeclContext *DC, clang::Decl *D)
     DC->addDecl(D);
 }
 
+JL_DLLEXPORT void AddTopLevelDecl(C, clang::NamedDecl *D)
+{
+    Cxx->CI->getSema().pushExternalDeclIntoScope(D, D->getDeclName());
+}
+
 JL_DLLEXPORT void *CreateDeclRefExpr(C,clang::ValueDecl *D, clang::CXXScopeSpec *scope, int islvalue)
 {
     clang::QualType T = D->getType();
@@ -1565,6 +1723,15 @@ JL_DLLEXPORT void *CreateDeclRefExpr(C,clang::ValueDecl *D, clang::CXXScopeSpec 
             scope->getWithLocInContext(Cxx->CI->getASTContext()) : clang::NestedNameSpecifierLoc(NULL,NULL),
             getTrivialSourceLocation(Cxx), D, false, getTrivialSourceLocation(Cxx),
             T.getNonReferenceType(), islvalue ? clang::VK_LValue : clang::VK_RValue);
+}
+
+JL_DLLEXPORT void *EmitDeclRef(C, clang::DeclRefExpr *DRE)
+{
+#ifdef LLVM38
+    return Cxx->CGF->EmitDeclRefLValue(DRE).getPointer();
+#else
+    return Cxx->CGF->EmitDeclRefLValue(DRE).getAddress();
+#endif
 }
 
 JL_DLLEXPORT void *DeduceReturnType(clang::Expr *expr)
@@ -1665,17 +1832,17 @@ JL_DLLEXPORT void *create_extract_value(C, Value *agg, size_t idx)
     return Cxx->CGF->Builder.CreateExtractValue(agg,ArrayRef<unsigned>((unsigned)idx));
 }
 
-JL_DLLEXPORT void *create_insert_value(llvm::IRBuilder<false> *builder, Value *agg, Value *val, size_t idx)
+JL_DLLEXPORT void *create_insert_value(CxxIRBuilder *builder, Value *agg, Value *val, size_t idx)
 {
     return builder->CreateInsertValue(agg,val,ArrayRef<unsigned>((unsigned)idx));
 }
 
-JL_DLLEXPORT void *CreateIntToPtr(llvm::IRBuilder<false> *builder, Value *TheInt, Type *Ty)
+JL_DLLEXPORT void *CreateIntToPtr(CxxIRBuilder *builder, Value *TheInt, Type *Ty)
 {
     return builder->CreateIntToPtr(TheInt, Ty);
 }
 
-JL_DLLEXPORT void *CreatePtrToInt(llvm::IRBuilder<false> *builder, Value *TheInt, Type *Ty)
+JL_DLLEXPORT void *CreatePtrToInt(CxxIRBuilder *builder, Value *TheInt, Type *Ty)
 {
     return builder->CreatePtrToInt(TheInt, Ty);
 }
@@ -1717,6 +1884,17 @@ JL_DLLEXPORT void *to_decl(clang::DeclContext *decl)
 JL_DLLEXPORT void *to_cxxdecl(clang::Decl *decl)
 {
     return dyn_cast<clang::CXXRecordDecl>(decl);
+}
+
+JL_DLLEXPORT char *getTypeNameAsString(void *T)
+{
+    const clang::LangOptions LO;
+    const clang::PrintingPolicy PP(LO);
+    clang::QualType QT = clang::QualType::getFromOpaquePtr(T);
+    std::string name = QT.getAsString(PP);
+    char *cname = (char*)malloc(name.size()+1);
+    memcpy(cname, name.c_str(), name.size()+1);
+    return cname;
 }
 
 JL_DLLEXPORT void *GetFunctionReturnType(clang::FunctionDecl *FD)
@@ -1946,12 +2124,12 @@ JL_DLLEXPORT void llvmtdump(void *t)
     ((llvm::Type*) t)->dump();
 }
 
-JL_DLLEXPORT void *createLoad(llvm::IRBuilder<false> *builder, llvm::Value *val)
+JL_DLLEXPORT void *createLoad(CxxIRBuilder *builder, llvm::Value *val)
 {
     return builder->CreateLoad(val);
 }
 
-JL_DLLEXPORT void *CreateConstGEP1_32(llvm::IRBuilder<false> *builder, llvm::Value *val, uint32_t idx)
+JL_DLLEXPORT void *CreateConstGEP1_32(CxxIRBuilder *builder, llvm::Value *val, uint32_t idx)
 {
     return (void*)builder->CreateConstGEP1_32(val,idx);
 }
@@ -2037,19 +2215,29 @@ JL_DLLEXPORT void *getStructElementType(llvm::Type *t, uint32_t i)
   return (void*)t->getStructElementType(i);
 }
 
-JL_DLLEXPORT void *CreateRet(llvm::IRBuilder<false> *builder, llvm::Value *ret)
+JL_DLLEXPORT void *CreateRet(CxxIRBuilder *builder, llvm::Value *ret)
 {
   return (void*)builder->CreateRet(ret);
 }
 
-JL_DLLEXPORT void *CreateRetVoid(llvm::IRBuilder<false> *builder)
+JL_DLLEXPORT void *CreateRetVoid(CxxIRBuilder *builder)
 {
   return (void*)builder->CreateRetVoid();
 }
 
-JL_DLLEXPORT void *CreateBitCast(llvm::IRBuilder<false> *builder, llvm::Value *val, llvm::Type *type)
+JL_DLLEXPORT void *CreateBitCast(CxxIRBuilder *builder, llvm::Value *val, llvm::Type *type)
 {
   return (void*)builder->CreateBitCast(val,type);
+}
+
+JL_DLLEXPORT void *CreateZext(CxxIRBuilder *builder, llvm::Value *val, llvm::Type *type)
+{
+  return (void*)builder->CreateZExt(val,type);
+}
+
+JL_DLLEXPORT void *CreateTrunc(CxxIRBuilder *builder, llvm::Value *val, llvm::Type *type)
+{
+  return (void*)builder->CreateTrunc(val,type);
 }
 
 JL_DLLEXPORT void *getConstantIntToPtr(llvm::Constant *CC, llvm::Type *type)
@@ -2361,7 +2549,12 @@ JL_DLLEXPORT void ExitParserScope(C)
 
 JL_DLLEXPORT void *CreateTemplateParameterList(C, clang::NamedDecl **D, size_t ND)
 {
+#ifdef LLVM38
+  return (void*)clang::TemplateParameterList::Create(Cxx->CI->getASTContext(), clang::SourceLocation(),
+    clang::SourceLocation(), ArrayRef<clang::NamedDecl*>(D, ND), clang::SourceLocation());
+#else
   return (void*)clang::TemplateParameterList::Create(Cxx->CI->getASTContext(), clang::SourceLocation(), clang::SourceLocation(), D, ND, clang::SourceLocation());
+#endif
 }
 
 JL_DLLEXPORT void *CreateFunctionTemplateDecl(C, clang::DeclContext *DC, clang::TemplateParameterList *Params, clang::FunctionDecl *FD)
@@ -2532,6 +2725,11 @@ JL_DLLEXPORT void SetDeclUsed(C,clang::Decl *D)
   D->markUsed(Cxx->CI->getASTContext());
 }
 
+JL_DLLEXPORT int IsDeclUsed(clang::Decl *D)
+{
+  return D->isUsed();
+}
+
 JL_DLLEXPORT void *getPointerElementType(llvm::Type *T)
 {
   return (void*)T->getPointerElementType ();
@@ -2628,6 +2826,39 @@ JL_DLLEXPORT void *getEmptyStructType()
 JL_DLLEXPORT void *getUnderlyingTypeOfEnum(clang::Type *T)
 {
   return (void*)clang::cast<clang::EnumType>(T)->getDecl()->getIntegerType().getAsOpaquePtr();
+}
+
+JL_DLLEXPORT void SetVarDeclInit(clang::VarDecl *VD, clang::Expr *Init)
+{
+  return VD->setInit(Init);
+}
+
+JL_DLLEXPORT void SetConstexpr(clang::VarDecl *VD)
+{
+  VD->setConstexpr(true);
+}
+
+JL_DLLEXPORT void InsertIntoShadowModule(C, llvm::Function *F)
+{
+  // Copy the declaration characteristics of the Function (not the body)
+  Function *NewF = Function::Create(F->getFunctionType(),
+                                    Function::ExternalLinkage,
+                                    F->getName(), Cxx->shadow);
+  // FunctionType does not include any attributes. Copy them over manually
+  // as codegen may make decisions based on the presence of certain attributes
+  NewF->copyAttributesFrom(F);
+
+#ifdef LLVM37
+  // Declarations are not allowed to have personality routines, but
+  // copyAttributesFrom sets them anyway, so clear them again manually
+  NewF->setPersonalityFn(nullptr);
+#endif
+
+#ifdef LLVM35
+  // DLLImport only needs to be set for the shadow module
+  // it just gets annoying in the JIT
+  NewF->setDLLStorageClass(GlobalValue::DefaultStorageClass);
+#endif
 }
 
 extern void *jl_pchar_to_string(const char *str, size_t len);

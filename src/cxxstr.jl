@@ -15,11 +15,11 @@ function llvmconst(val::ANY)
                 return getConstantFloat(julia_to_llvm(T),Float64(val))
             elseif T <: Integer
                 return getConstantInt(julia_to_llvm(T),UInt64(val))
-            elseif T <: Ptr
-                int = getConstantInt(julia_to_llvm(UInt64),UInt64(val))
-                return getConstantIntToPtr(int, julia_to_llvm(T))
+            elseif T <: Ptr || T <: CppPtr
+                int = getConstantInt(julia_to_llvm(UInt64),UInt64(Ptr{Void}(val)))
+                return getConstantIntToPtr(int, julia_to_llvm(Ptr{Void}))
             else
-                error("Creating LLVM constants for type `T` not implemented yet")
+                error("Creating LLVM constants for type `$T` not implemented yet")
             end
         elseif sizeof(T) == 0
             return getConstantStruct(getEmptyStructType(),pcpp"llvm::Constant"[])
@@ -37,24 +37,31 @@ end
 
 const specTypes = 8
 function ssv(C,e::ANY,ctx,varnum,sourcebuf,typeargs=Dict{Void,Void}())
+    iscc = isCCompiler(C)
     if isa(e,Type)
         QT = cpptype(C,e)
-        name = string("var",varnum)
+        name = string(iscc ? "__juliaglobalvar" : "var",varnum)
         sv = CreateTypeDefDecl(C,ctx,name,QT)
     elseif isa(e,TypeVar)
         str = takebuf_string(sourcebuf)
-        name = string("var",varnum)
-        write(sourcebuf, replace(str, string("__julia::var",varnum), name))
+        name = string(iscc ? "__juliaglobalvar" : "var",varnum)
+        write(sourcebuf, replace(str, string(iscc ? "__juliavar" : "__julia::var",varnum), name))
         sv = ActOnTypeParameterParserScope(C,name,varnum)
         typeargs[varnum] = e
         return e, sv
     else
         e = cppconvert(e)
         T = typeof(e)
-        name = string("var",varnum)
+        name = string(iscc ? "__juliaglobalvar" : "var",varnum)
         sv = CreateVarDecl(C,ctx,name,cpptype(C,T))
     end
-    AddDeclToDeclCtx(ctx,pcpp"clang::Decl"(convert(Ptr{Void}, sv)))
+    decl = pcpp"clang::Decl"(convert(Ptr{Void}, sv))
+    if iscc
+        AddTopLevelDecl(C, decl)
+    else
+        AddDeclToDeclCtx(ctx, decl)
+    end
+    SetDeclUsed(C, decl)
     e, sv
 end
 
@@ -96,19 +103,23 @@ function InstantiateSpecializationsForType(C, DC, LambdaT)
         PVoid = cpptype(C,Int)
         tpvds = pcpp"clang::ParmVarDecl"[]
         specTypes = Type[]
+        byPtrList = Bool[]
 
         useBoxed = false
         types = pcpp"clang::Type"[]
         for i = 1:nargs
             T = getTargTypeAtIdx(TP,i-1)
             specT = juliatype(T)
-            push!(specTypes, specT <: CxxBuiltinTs ? specT : juliatype(pointerTo(C,T)))
+            byPtr = !(specT <: Union{CxxBuiltinTs, CppRef, CppPtr} ||
+                (specT <: Ptr && specT.parameters[1] <: CxxBuiltinTs))
+            push!(specTypes, byPtr ? juliatype(pointerTo(C,T)) : specT)
+            push!(byPtrList, byPtr)
             push!(types, canonicalType(extractTypePtr(T)))
             push!(tpvds, getParmVarDecl(x,i-1))
         end
 
         # Step 2: Create the instantiated julia function
-        F = first(LambdaT.name.mt)
+        F = LambdaT.name.mt.defs
         for pvd in tpvds
             SetDeclUsed(C,pvd)
         end
@@ -124,18 +135,16 @@ function InstantiateSpecializationsForType(C, DC, LambdaT)
         if isa(T,Union) || T.abstract
           error("Inferred Union or abstract type $T for expression $F")
         end
-        if T !== Void
-          error("Currently only `Void` is supported for nested expressions")
-        end
 
         # We can emit a direct llvm-level reference to this
-        f = pcpp"llvm::Function"(ccall(:jl_get_llvmf, Ptr{Void}, (Any,Any,Bool,Bool), F, ST, false, true))
+        f = pcpp"llvm::Function"(ccall(:jl_get_llvmf, Ptr{Void}, (Any,Bool,Bool), ST, false, true))
         @assert f != C_NULL
 
         # Create a Clang function Decl to represent this julia function
         ExternCDC = CreateLinkageSpec(C, DC, LANG_C)
-        argtypes = [xT <: CxxBuiltinTs ? getTargTypeAtIdx(TP,i-1) : PVoid for (i,xT) in enumerate(specTypes)]
+        argtypes = [byPtr ? PVoid : getTargTypeAtIdx(TP,i-1) for (i,byPtr) in enumerate(byPtrList)]
         sizeof(LambdaT) == 0 || unshift!(argtypes, pointerTo(C, getPointeeType(cpptype(C,LambdaT))))
+        InsertIntoShadowModule(C, f)
         JFD = CreateFunctionDecl(C, ExternCDC, getName(f), makeFunctionType(C, cpptype(C,T), argtypes))
 
         params = pcpp"clang::ParmVarDecl"[]
@@ -150,7 +159,7 @@ function InstantiateSpecializationsForType(C, DC, LambdaT)
         sizeof(LambdaT) == 0 || push!(callargs, CreateThisExpr(C, pointerTo(C, getPointeeType(cpptype(C, LambdaT)))))
         for (i,pvd) in enumerate(tpvds)
             e = dre = CreateDeclRefExpr(C,pvd)
-            if !(specTypes[i] <: CxxBuiltinTs)
+            if byPtrList[i]
                 e = createCast(C,CreateAddrOfExpr(C,dre),PVoid,CK_PointerToIntegral)
             end
             push!(callargs, e)
@@ -172,7 +181,7 @@ end
 function ArgCleanup(C,e,sv)
     if isa(sv,pcpp"clang::FunctionDecl")
         tt = Tuple{typeof(e)}
-        f = pcpp"llvm::Function"(ccall(:jl_get_llvmf, Ptr{Void}, (Any,Any,Bool,Bool), e, tt, false, true))
+        f = pcpp"llvm::Function"(ccall(:jl_get_llvmf, Ptr{Void}, (Any,Bool,Bool), tt, false, true))
         @assert f != C_NULL
         ReplaceFunctionForDecl(C,sv,f)
     elseif !isa(e,Type) && !isa(e,TypeVar)
@@ -222,15 +231,24 @@ function EmitTopLevelDecl(C, D::pcpp"clang::Decl")
 end
 EmitTopLevelDecl(C,D::pcpp"clang::FunctionDecl") = EmitTopLevelDecl(C,pcpp"clang::Decl"(convert(Ptr{Void}, D)))
 
+function cppconst(C, Val)
+    if isa(Val, Integer)
+        return CreateIntegerLiteral(C, (Val%UInt64), cpptype(C, typeof(Val)))
+    else
+        error("Don't know how to make this a C++ constant")
+    end
+end
+
 #
 # Create a clang FunctionDecl with the given body and
 # and the given types for embedded __juliavars
 #
-function CreateFunctionWithBody(C,body,args...; filename::Symbol = symbol(""), line::Int = 1, col::Int = 1)
+function CreateFunctionWithBody(C,body,args...; named_args = Any[],
+        filename::Symbol = Symbol(""), line::Int = 1, col::Int = 1)
     global icxxcounter
 
     argtypes = Tuple{Int,QualType}[]
-    typeargs = Tuple{Int,QualType}[]
+    typeargs = Tuple{Int,Any}[]
     callargs = Int[]
     llvmargs = Any[]
     argidxs = Int[]
@@ -243,8 +261,18 @@ function CreateFunctionWithBody(C,body,args...; filename::Symbol = symbol(""), l
         # We passed in an actual julia type
         symarg = :(args[$i])
         if arg <: Type
-            body = replace(body,"__juliavar$i","__juliatype$i")
-            push!(typeargs,(i,cpptype(C,arg.parameters[1])))
+            if arg.parameters[1] <: Val
+                body = replace(body,"__juliavar$i","__juliaconst$icxxcounter")
+                push!(typeargs,(icxxcounter,arg.parameters[1].parameters[1]))
+            else
+                body = replace(body,"__juliavar$i","__juliatype$icxxcounter")
+                push!(typeargs,(icxxcounter,cpptype(C,arg.parameters[1])))
+            end
+            icxxcounter += 1
+        elseif arg <: Val
+            body = replace(body,"__juliavar$i","__juliaconst$icxxcounter")
+            push!(typeargs,(icxxcounter,arg.parameters[1]))
+            icxxcounter += 1
         else
             arg, symarg = cxxtransform(arg,symarg)
             T = cpptype(C,arg)
@@ -256,7 +284,11 @@ function CreateFunctionWithBody(C,body,args...; filename::Symbol = symbol(""), l
         push!(symargs,symarg)
     end
 
-    if filename == symbol("")
+    for (i,(name, T)) in enumerate(named_args)
+        push!(argtypes,(length(args)+i,cpptype(C,T)))
+    end
+
+    if filename == Symbol("")
         EnterBuffer(C,body)
     else
         EnterVirtualSource(C,body,VirtualFileName(filename))
@@ -273,11 +305,19 @@ function CreateFunctionWithBody(C,body,args...; filename::Symbol = symbol(""), l
             QualType[ T for (_,T) in argtypes ]),false)
         params = pcpp"clang::ParmVarDecl"[]
         for (i,argt) in argtypes
-            param = CreateParmVarDecl(C, argt,string("__juliavar",i))
+            is_named = i > length(args)
+            name = is_named ? named_args[i-length(args)][1] : string("__juliavar",i)
+            param = CreateParmVarDecl(C, argt, name; used = !is_named)
             push!(params,param)
         end
         for (i,T) in typeargs
-            D = CreateTypeDefDecl(C,ctx,"__juliatype$i",T)
+            if isa(T, QualType)
+                D = CreateTypeDefDecl(C,ctx,"__juliatype$i",T)
+            else
+                D = CreateVarDecl(C,ctx,"__juliaconst$i",constQualified(cpptype(C,typeof(T))))
+                SetVarDeclInit(D, cppconst(C, T))
+                SetConstexpr(D)
+            end
             AddDeclToDeclCtx(ctx,pcpp"clang::Decl"(convert(Ptr{Void}, D)))
         end
         SetFDParams(FD,params)
@@ -289,12 +329,9 @@ function CreateFunctionWithBody(C,body,args...; filename::Symbol = symbol(""), l
         end
     end
 
-    # dump(FD)
-
-    EmitTopLevelDecl(C,FD)
-
     FD, llvmargs, argidxs, symargs
 end
+
 
 function CallDNE(C, dne, argt; kwargs...)
     callargs, pvds = buildargexprs(C,argt)
@@ -308,6 +345,7 @@ end
     buf, filename, line, col = sourcebuffers[id]
 
     FD, llvmargs, argidxs, symargs = CreateFunctionWithBody(C,buf, args...; filename = filename, line = line, col = col)
+    EmitTopLevelDecl(C,FD)
 
     for T in args
         if haskey(MappedTypes, T)
@@ -371,8 +409,8 @@ end
 
 collect_icxx(compiler, s, icxxs) = s
 function collect_icxx(compiler, e::Expr,icxxs)
-    if isexpr(e,:macrocall) && e.args[1] == symbol("@icxx_str")
-        x = symbol(string("arg",length(icxxs)+1))
+    if isexpr(e,:macrocall) && e.args[1] == Symbol("@icxx_str")
+        x = Symbol(string("arg",length(icxxs)+1))
         exprs, str = collect_exprs(e.args[2])
         push!(icxxs, (x,str,exprs))
         return Expr(:call, Cxx.lambdacall, compiler, x, [e[1] for e in exprs]...)
@@ -384,7 +422,7 @@ function collect_icxx(compiler, e::Expr,icxxs)
     e
 end
 
-function process_body(compiler, str, global_scope = true, cxxt = false, filename=symbol(""),line=1,col=1)
+function process_body(compiler, str, global_scope = true, cxxt = false, filename=Symbol(""),line=1,col=1)
     # First we transform the source buffer by pulling out julia expressions
     # and replaceing them by expression like __julia::var1, which we can
     # later intercept in our external sema source
@@ -398,13 +436,13 @@ function process_body(compiler, str, global_scope = true, cxxt = false, filename
     if !global_scope && !cxxt
         write(sourcebuf,"{\n")
     end
-    if !cxxt && filename != symbol("")
+    if !cxxt && filename != Symbol("")
         if filename == :none
             filename = :REPL
         end
         write(sourcebuf,"#line $line \"$filename\"\n")
         if filename == :REPL
-            filename = symbol(joinpath(pwd(),"REPL"))
+            filename = Symbol(joinpath(pwd(),"REPL"))
         end
     end
     # Clang has no function for setting the column
@@ -429,7 +467,7 @@ function process_body(compiler, str, global_scope = true, cxxt = false, filename
             collect_icxx(compiler, expr,this_icxxs)
         end
         push!(exprs, isexpr ?
-            Expr(:->,Expr(:tuple,map(i->symbol(string("arg",i)),1:length(this_icxxs))...),
+            Expr(:->,Expr(:tuple,map(i->Symbol(string("arg",i)),1:length(this_icxxs))...),
                 expr.args[1]) : expr)
         push!(isexprs,isexpr)
 
@@ -489,21 +527,26 @@ end
     typename = string(t.parameters[1])
     varnum = 0
     mapping = Dict{Int,Any}()
-    jns = cglobal((:julia_namespace,libcxxffi),Ptr{Void})
-    ns = Cxx.createNamespace(C,"julia")
-    ctx = Cxx.toctx(pcpp"clang::Decl"(convert(Ptr{Void},ns)))
-    unsafe_store!(jns,convert(Ptr{Void},ns))
-    Cxx.EnterParserScope(C)
+    iscc = isCCompiler(C)
+    if !iscc
+        jns = cglobal((:julia_namespace,libcxxffi),Ptr{Void})
+        ns = Cxx.createNamespace(C,"julia")
+        ctx = Cxx.toctx(pcpp"clang::Decl"(convert(Ptr{Void},ns)))
+        unsafe_store!(jns,convert(Ptr{Void},ns))
+        Cxx.EnterParserScope(C)
+    else
+        ctx = Cxx.to_ctx(translation_unit(C))
+    end
     for (i,arg) in enumerate(args)
         if arg == TypeVar || arg <: Integer
-            name = string("var",varnum)
-            typename = replace(typename, string("__julia::var",i), name)
+            name = string(iscc ? "__juliavar" : "var",varnum)
+            typename = replace(typename, string(iscc ? "__juliavar" : "__julia::var",i), name)
             ActOnTypeParameterParserScope(C,name,varnum)
             mapping[varnum] = :(args[$i])
             varnum += 1
         elseif arg <: Type
             QT = cpptype(C,arg.parameters[1])
-            name = string("var",i)
+            name = string(iscc ? "__juliavar" : "var",i)
             sv = CreateTypeDefDecl(C,ctx,name,QT)
             AddDeclToDeclCtx(ctx,pcpp"clang::Decl"(convert(Ptr{Void},sv)))
         end
@@ -511,8 +554,10 @@ end
     x = Cxx.ParseVirtual(C, typename,
         VirtualFileName(string(loc.parameters[1])), loc.parameters[1],
         loc.parameters[2], loc.parameters[3], true)
-    Cxx.ExitParserScope(C)
-    unsafe_store!(jns,C_NULL)
+    if !iscc
+        Cxx.ExitParserScope(C)
+        unsafe_store!(jns,C_NULL)
+    end
     ret = juliatype(x,true,mapping)
     ret
 end
@@ -544,7 +589,14 @@ function build_icxx_expr(id, exprs, isexprs, icxxs, compiler, impl_func = cxxstr
     return setup
 end
 
-function process_cxx_string(str,global_scope = true,type_name = false,filename=symbol(""),line=1,col=1;
+function adjust_source(C, source)
+    if isCCompiler(C)
+        return replace(source, "__julia::", "__juliaglobal")
+    end
+    source
+end
+
+function process_cxx_string(str,global_scope = true,type_name = false,filename=Symbol(""),line=1,col=1;
     compiler = :__current_compiler__, tojuliatype = true)
     startvarnum, sourcebuf, exprs, isexprs, icxxs =
         process_body(compiler, str, global_scope, !global_scope && type_name, filename, line, col)
@@ -552,7 +604,7 @@ function process_cxx_string(str,global_scope = true,type_name = false,filename=s
         argsetup = Expr(:block)
         argcleanup = Expr(:block)
         postparse = Expr(:block)
-        instance = :( Cxx.instance($compiler) )
+        instance = gensym()
         ctx = gensym()
         typeargs = gensym()
         for i in 1:length(exprs)
@@ -574,8 +626,8 @@ function process_cxx_string(str,global_scope = true,type_name = false,filename=s
             push!(postparse.args,:(Cxx.RealizeTemplates($instance,$ctx,$s)))
             startvarnum += 1
         end
-        parsecode = filename == "" ? :( cxxparse($instance,takebuf_string($sourcebuf),$type_name) ) :
-            :( Cxx.ParseVirtual($instance, takebuf_string($sourcebuf),
+        parsecode = filename == "" ? :( cxxparse($instance,Cxx.adjust_source($instance,takebuf_string($sourcebuf)),$type_name) ) :
+            :( Cxx.ParseVirtual($instance, Cxx.adjust_source($instance,takebuf_string($sourcebuf)),
                 $( VirtualFileName(filename) ),
                 $( quot(filename) ),
                 $( line ),
@@ -597,10 +649,14 @@ function process_cxx_string(str,global_scope = true,type_name = false,filename=s
         end
         return quote
             let
+                $instance = Cxx.instance($compiler)
                 jns = cglobal((:julia_namespace,$libcxxffi),Ptr{Void})
-                ns = Cxx.createNamespace($instance,"julia")
-                $ctx = Cxx.toctx(pcpp"clang::Decl"(convert(Ptr{Void},ns)))
-                unsafe_store!(jns,convert(Ptr{Void},ns))
+                $ctx = Cxx.toctx((Cxx.isCCompiler($instance) ?
+                    Cxx.translation_unit($instance) : begin
+                    ns = Cxx.createNamespace($instance,"julia")
+                    unsafe_store!(jns,convert(Ptr{Void},ns))
+                    pcpp"clang::Decl"(convert(Ptr{Void},ns))
+                end))
                 $argsetup
                 $argcleanup
                 $x = $parsecode
@@ -612,7 +668,7 @@ function process_cxx_string(str,global_scope = true,type_name = false,filename=s
     else
         if type_name
             Expr(:call,Cxx.CxxType,:__current_compiler__,
-                CxxTypeName{symbol(takebuf_string(sourcebuf))}(),CodeLoc{filename,line,col}(),exprs...)
+                CxxTypeName{Symbol(takebuf_string(sourcebuf))}(),CodeLoc{filename,line,col}(),exprs...)
         else
             push!(sourcebuffers,(takebuf_string(sourcebuf),filename,line,col))
             id = length(sourcebuffers)

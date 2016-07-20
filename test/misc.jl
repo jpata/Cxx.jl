@@ -224,7 +224,7 @@ struct testDestruct {
 """
 X = icxx"return testDestruct{10};"
 finalize(X)
-@test icxx"testDestructCounter;" == 10
+@test icxx"testDestructCounter == 10;"
 
 # Template dispatch
 foo{T}(x::cxxt"std::vector<$T>") = icxx"$x.size();"
@@ -374,3 +374,35 @@ int x_,y_,z_;
 v232 = icxx"std::vector<PointXYZ232>();";
 icxx"""$v232.push_back(PointXYZ232(0,0,0));""";
 @assert typeof(icxx"$v232[0];") <: Cxx.CppRef
+
+# #243
+counter243 = 0
+let body243 = i->(@assert 1 == unsafe_load(i); global counter243; counter243 += 1; nothing)
+    icxx"int x = 1; $body243(x);"
+    icxx"int x = 1; $body243(&x);"
+end
+@assert counter243 == 2
+cxx"""
+struct foo243 {
+    int x;
+};
+"""
+let body243b = i->(@assert 1 == icxx"$i->x;"; global counter243; counter243 += 1; nothing)
+    icxx"foo243 x{1}; $body243b(&x);"
+end
+@assert counter243 == 3
+
+# #246
+cxx"""
+template <int i> class Template246 {
+public:
+    int getI() { return i; }
+};
+"""
+@assert icxx"Template246<$(Val{5})>().getI();" == 5
+@assert icxx"Template246<$(Val{5}())>().getI();" == 5
+
+# #256
+typealias SVP{T} cxxt"std::vector<$T>*"
+# This is a bug!
+# @assert SVP{cxxt"std::string"} == cxxt"std::vector<std::string>*"

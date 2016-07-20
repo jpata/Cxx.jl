@@ -4,7 +4,7 @@
 # adding header search directories is done in this file.
 
 # Paths
-basepath = joinpath(JULIA_HOME, "../../")
+basepath = joinpath(BASE_JULIA_HOME, "../../")
 depspath = joinpath(basepath, "deps", "srccache")
 
 # Load the Cxx.jl bootstrap library (in debug version if we're running the Julia
@@ -21,13 +21,20 @@ function init_libcxxffi()
 end
 init_libcxxffi()
 
-function setup_instance(UsePCH = C_NULL)
+function setup_instance(UsePCH = C_NULL; makeCCompiler=false, target = C_NULL, CPU = C_NULL)
     x = Array(ClangCompiler,1)
-    sysroot = @osx? strip(readstring(`xcodebuild -version -sdk macosx Path`)) : C_NULL
+    sysroot = @static is_apple() ? strip(readstring(`xcodebuild -version -sdk macosx Path`)) : C_NULL
     EmitPCH = true
     ccall((:init_clang_instance,libcxxffi),Void,
-        (Ptr{Void},Ptr{UInt8},Ptr{UInt8},Bool,Ptr{UInt8},Ptr{Void}),
-        x,C_NULL,sysroot,EmitPCH,UsePCH,julia_to_llvm(Any))
+        (Ptr{Void},Ptr{UInt8},Ptr{UInt8},Ptr{UInt8},Bool,Bool,Ptr{UInt8},Ptr{Void}),
+        x,target,CPU,sysroot,EmitPCH,makeCCompiler,UsePCH,julia_to_llvm(Any))
+    x[1]
+end
+
+function setup_instance_from_inovcation(invocation)
+    x = Array(ClangCompiler,1)
+    ccall((:init_clang_instance_from_invocation,libcxxffi),Void,
+        (Ptr{Void},Ptr{Void}), x, invocation)
     x[1]
 end
 
@@ -83,12 +90,12 @@ end
 # Enter's the buffer, while pretending it's the contents of the file at path
 # `file`. Note that if `file` actually exists and is included from somewhere
 # else, `buf` will be included instead.
-function EnterVirtualSource(C,buf,file::ByteString)
+function EnterVirtualSource(C,buf,file::String)
     ccall((:EnterVirtualFile,libcxxffi),Void,
         (Ptr{ClangCompiler},Ptr{UInt8},Csize_t,Ptr{UInt8},Csize_t),
         &C,buf,sizeof(buf),file,sizeof(file))
 end
-EnterVirtualSource(C,buf,file::Symbol) = EnterVirtualSource(C,buf,bytestring(file))
+EnterVirtualSource(C,buf,file::Symbol) = EnterVirtualSource(C,buf,string(file))
 
 # Parses everything until the end of the currently entered source file
 # Returns true if the file was successfully parsed (i.e. no error occurred)
@@ -174,7 +181,7 @@ defineMacro(Name) = defineMacro(__default_compiler__,Name)
 nostdcxx = haskey(ENV,"CXXJL_NOSTDCXX")
 
 # On OS X, we just use the libc++ headers that ship with XCode
-@osx_only function addStdHeaders(C)
+@static if is_apple() function addStdHeaders(C)
     xcode_path =
         "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/"
     didfind = false
@@ -185,7 +192,8 @@ nostdcxx = haskey(ENV,"CXXJL_NOSTDCXX")
         end
     end
     didfind || error("Could not find C++ standard library. Is XCode installed?")
-end
+end # function addStdHeaders(C)
+end # is_apple
 
 # On linux the situation is a little more complicated as the system header is
 # generally shipped with GCC, which every distribution seems to put in a
@@ -224,8 +232,7 @@ function ScanLibDirForGCCTriple(base,triple)
             end
             InstallPath = path * "/" * dir
             IncPath = InstallPath * isuffix * "/../include"
-            if
-               ( !isdir( IncPath * "/" * triple * "/c++/" * dir ) ||
+            if ( !isdir( IncPath * "/" * triple * "/c++/" * dir ) ||
                   !isdir( IncPath * "/c++/" * dir ) )  &&
                ( !isdir( IncPath * "/c++/" * dir * "/" * triple ) ||
                   !isdir( IncPath * "/c++/" * dir ) )  &&
@@ -258,7 +265,9 @@ function AddLinuxHeaderPaths(C)
                         "i486-slackware-linux", "i686-montavista-linux", "i686-linux-android",
                         "i586-linux-gnu"]
 
-    const Prefixes = ["/usr"]
+
+    CXXJL_ROOTDIR = get(ENV, "CXXJL_ROOTDIR", "") * "/usr"
+    const Prefixes = [ CXXJL_ROOTDIR ]
 
     LibDirs = (Int === Int64 ? X86_64LibDirs : X86LibDirs)
     Triples = (Int === Int64 ? X86_64Triples : X86Triples)
@@ -289,8 +298,6 @@ function AddLinuxHeaderPaths(C)
 
     incpath = Path * "/../include"
 
-    incpath = Path * "/../include"
-
     addHeaderDir(C, incpath, kind = C_System)
     addHeaderDir(C, incpath * "/c++/" * VersionString, kind = C_System)
     addHeaderDir(C, incpath * "/c++/" * VersionString * "/backward", kind = C_System)
@@ -307,22 +314,35 @@ function AddLinuxHeaderPaths(C)
     end
 end
 
-@linux_only function addStdHeaders(C)
+@static if is_linux() function addStdHeaders(C)
     AddLinuxHeaderPaths(C)
     addHeaderDir(C,"/usr/include", kind = C_System);
-end
+end # function addStdHeaders(C)
+end # is_linux
 
-@windows_only function addStdHeaders(C)
+@static if is_windows() function addStdHeaders(C)
       base = "C:/mingw-builds/x64-4.8.1-win32-seh-rev5/mingw64/"
       addHeaderDir(C,joinpath(base,"x86_64-w64-mingw32/include"), kind = C_System)
       #addHeaderDir(joinpath(base,"lib/gcc/x86_64-w64-mingw32/4.8.1/include/"), kind = C_System)
       addHeaderDir(C,joinpath(base,"lib/gcc/x86_64-w64-mingw32/4.8.1/include/c++"), kind = C_System)
       addHeaderDir(C,joinpath(base,"lib/gcc/x86_64-w64-mingw32/4.8.1/include/c++/x86_64-w64-mingw32"), kind = C_System)
-end
+end #function addStdHeaders(C)
+end # is_windows
 
+# Also add clang's intrinsic headers
 function addClangHeaders(C)
-    # Also add clang's intrinsic headers
-    addHeaderDir(C,joinpath(JULIA_HOME,"../lib/clang/$(Base.libllvm_version)/include/"), kind = C_ExternCSystem)
+    ver = Base.VersionNumber(Base.libllvm_version)
+    ver = Base.VersionNumber(ver.major, ver.minor, ver.patch)        
+    baseclangdir = joinpath(BASE_JULIA_HOME,
+        "../lib/clang/$ver/include/")
+    cxxclangdir = joinpath(dirname(@__FILE__),
+        "../deps/build/clang-$(Base.libllvm_version)/lib/clang/$ver/include")
+    if isdir(baseclangdir)
+        addHeaderDir(C, baseclangdir, kind = C_ExternCSystem)
+    else
+        @assert isdir(cxxclangdir)
+        addHeaderDir(C, cxxclangdir, kind = C_ExternCSystem)
+    end
 end
 
 function initialize_instance!(C; register_boot = true)
@@ -347,11 +367,11 @@ function __init__()
     push!(active_instances, C)
     # Setup exception translation callback
     callback = cglobal((:process_cxx_exception,libcxxffi),Ptr{Void})
-    unsafe_store!(callback, cfunction(process_cxx_exception,Void,Tuple{UInt64,Ptr{Void}}))
+    unsafe_store!(callback, cfunction(process_cxx_exception,Union{},Tuple{UInt64,Ptr{Void}}))
 end
 
-function new_clang_instance(register_boot = true)
-    C = setup_instance()
+function new_clang_instance(register_boot = true, makeCCompiler = false; target = C_NULL, CPU = C_NULL)
+    C = setup_instance(makeCCompiler = makeCCompiler, target = target, CPU = CPU)
     initialize_instance!(C; register_boot = register_boot)
     push!(active_instances, C)
     CxxInstance{length(active_instances)}()

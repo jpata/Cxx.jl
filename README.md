@@ -1,13 +1,13 @@
 ##Cxx.jl
 
-The Julia C++ Foreign Function Interface (FFI).
+The Julia C++ Foreign Function Interface (FFI) and REPL.
+
+![REPL Screenshot](doc/screenshot.png "C++ REPL Screenshot")
 
 
 ### Installation
 
-You will need to install Julia v0.4-dev with some special options.
-
-Cxx.jl requires "staged functions" amongst other things available only in v0.4. It also requires the development version of LLVM, which is currently targeting version 3.7.
+You will need to install Julia v0.5-dev with some special options.
 
 #### Build requirements
 
@@ -172,14 +172,14 @@ julia> cxx"""
        """
 # Access enum
 julia> @cxx Klassy::Bar
-CppEnum{symbol("Klassy::Foo")}(0)
+CppEnum{Symbol("Klassy::Foo")}(0)
 
 # Pass enum as an argument
 julia> @cxx Klassy::exec(@cxx(Klassy::Baz))
-CppEnum{symbol("Klassy::Foo")}(1)
+CppEnum{Symbol("Klassy::Foo")}(1)
 ```
 #### Example 7: C++ Hello World class
-```
+```julia
 julia> using Cxx
 julia> cxx"""#include <iostream>
        class Hello
@@ -274,4 +274,14 @@ julia> pointer_to_array(arr, 5)
   8.0
  16.0
  32.0
+```
+
+### Troubleshooting
+
+#### Replacement the current compiler instance
+
+As of now Cxx.jl does not allow redefinition of a function. In order to allow defining the same function multiple times the current compiler instance can be replaced by typing
+
+```julia
+__current_compiler__ = Cxx.new_clang_instance()
 ```

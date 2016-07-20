@@ -1,5 +1,7 @@
 # Translating between clang and julia types
 
+import Base: unsafe_string
+
 # # # # Section 1: Mapping Julia types to clang types
 #
 # The main function defined by this section is cpptype(T), which for a given
@@ -111,9 +113,9 @@ function lookup_name(C::ClangCompiler,parts, cxxscope = C_NULL, start=translatio
         cur = _lookup_name(C,fpart,primary_ctx(toctx(cur)))
         if cur == C_NULL
             if lastcur == translation_unit(C)
-                error("Could not find $fpart in translation unit")
+                error("Could not find `$fpart` in translation unit")
             else
-                error("Could not find $fpart in context $(_decl_name(lastcur))")
+                error("Could not find `$fpart` in context $(_decl_name(lastcur))")
             end
         end
     end
@@ -288,8 +290,10 @@ function cpptype{T}(C,::Type{T})
         # For callable julia types, also add an operator() method to the anonymous
         # class
         if !isempty(T.name.mt)
-            tt = Tuple{T}
-            linfo = first(T.name.mt).func
+            linfo = T.name.mt.defs.func
+            sig = T.name.mt.defs.sig
+            nargt = length(sig.parameters)-1
+            tt = Tuple{T,(Any for _ in 1:nargt)...}
             (tree, retty) = Core.Inference.typeinf(linfo,tt,svec())
             if isa(retty,Union) || retty.abstract
               error("Inferred Union or abstract type $retty for return value of lambda")
@@ -300,7 +304,7 @@ function cpptype{T}(C,::Type{T})
             tparamnum = 1
             TPs = Any[]
             argtQTs = QualType[]
-            for argt in first(T.name.mt).sig.parameters[2:end]
+            for argt in sig.parameters[2:end]
                 if argt.abstract
                     TP = ActOnTypeParameter(C,string("param",tparamnum),tparamnum-1)
                     push!(argtQTs,RValueRefernceTo(C,QualType(typeForDecl(TP))))
@@ -313,8 +317,9 @@ function cpptype{T}(C,::Type{T})
             if isempty(TPs)
                 Method = CreateCxxCallMethodDecl(C, AnonClass, makeFunctionType(C, cpptype(C, retty), argtQTs))
                 AddCallOpToClass(AnonClass, Method)
-                f = pcpp"llvm::Function"(ccall(:jl_get_llvmf, Ptr{Void}, (Any,Any,Bool,Bool), T, tt, false, true))
+                f = pcpp"llvm::Function"(ccall(:jl_get_llvmf, Ptr{Void}, (Any,Bool,Bool), tt, false, true))
                 @assert f != C_NULL
+                FinalizeAnonClass(C, AnonClass)
                 ReplaceFunctionForDecl(C, Method,f, DoInline = false, specsig = isbits(T) || isbits(retty),
                     NeedsBoxed = [false], FirstIsEnv = true, jts = Any[T])
             else
@@ -325,9 +330,9 @@ function cpptype{T}(C,::Type{T})
                 SetFDParams(Method,params)
                 D = CreateFunctionTemplateDecl(C,toctx(AnonClass),Params,Method)
                 AddDeclToDeclCtx(toctx(AnonClass),pcpp"clang::Decl"(convert(Ptr{Void}, D)))
+                FinalizeAnonClass(C, AnonClass)
             end
         end
-        FinalizeAnonClass(C, AnonClass)
 
         # Anything that you want C++ to be able to do with a julia object
         # needs to be declared here.
@@ -353,14 +358,14 @@ end
 
 function _decl_name(d)
     s = __decl_name(d)
-    ret = bytestring(s)
+    ret = unsafe_string(s)
     Libc.free(s)
     ret
 end
 
 function simple_decl_name(d)
     s = ccall((:simple_decl_name,libcxxffi),Ptr{UInt8},(Ptr{Void},),d)
-    ret = bytestring(s)
+    ret = unsafe_string(s)
     Libc.free(s)
     ret
 end
@@ -381,7 +386,7 @@ end
 
 function get_name(t)
     s = _get_name(t)
-    ret = bytestring(s)
+    ret = unsafe_string(s)
     Libc.free(s)
     ret
 end
@@ -425,31 +430,9 @@ function getTemplateParameters(cxxd,quoted = false,typeargs = Dict{Int64,Void}()
     return quoted ? Expr(:curly,:Tuple,args...) : Tuple{args...}
 end
 
-# TODO: Autogenerate this from the appropriate header
-const cVoid      = 0
-const cBool      = 1
-const cChar_U    = 2
-const cUChar     = 3
-const cWChar_U   = 4
-const cChar16    = 5
-const cChar32    = 6
-const cUShort    = 7
-const cUInt      = 8
-const cULong     = 9
-const cULongLong = 10
-const CUInt128   = 11
-const cChar_S    = 12
-const cSChar     = 13
-const cWChar_S   = 14
-const cShort     = 15
-const cInt       = 16
-const cLong      = 17
-const cLongLong  = 18
-const cInt128    = 19
-const cHalf      = 20
-const cFloat     = 21
-const cDouble    = 22
+include(joinpath(dirname(@__FILE__),"../deps/build/clang_constants.jl"))
 
+# TODO: Autogenerate this from the appropriate header
 # Decl::Kind
 const LinkageSpec = 10
 
@@ -459,7 +442,7 @@ getPointeeType(t::QualType) = getPointeeType(extractTypePtr(t))
 canonicalType(t::pcpp"clang::Type") = pcpp"clang::Type"(ccall((:canonicalType,libcxxffi),Ptr{Void},(Ptr{Void},),t))
 
 function toBaseType(t::pcpp"clang::Type")
-    T = CppBaseType{symbol(get_name(t))}
+    T = CppBaseType{Symbol(get_name(t))}
     rd = getAsCXXRecordDecl(t)
     if rd != C_NULL
         targs = getTemplateParameters(rd)
@@ -490,24 +473,25 @@ function juliatype(t::QualType, quoted = false, typeargs = Dict{Int,Void}();
     elseif isBooleanType(t)
         T = Bool
     elseif isPointerType(t)
-        @assert !quoted
         pt = getPointeeType(t)
         tt = juliatype(pt,quoted,typeargs)
-        if tt <: CppFunc
-            return CppFptr{tt}
-        elseif CVR != NullCVR || tt <: CppValue || tt <: CppPtr || tt <: CppRef
-            if tt <: CppValue
-                tt = tt.parameters[1]
+        if isa(tt,Expr) ? tt.args[1] == :CppFunc : tt <: CppFunc
+            return quoted ? :(CppFptr{$tt}) : CppFptr{tt}
+        elseif CVR != NullCVR || isa(tt,Expr) ?
+            (tt.args[1] == :CppValue || tt.args[1] == :CppPtr || tt.args[1] == :CppRef) :
+            (tt <: CppValue || tt <: CppPtr || tt <: CppRef)
+            if isa(tt,Expr) ? tt.args[1] == :CppValue : tt <: CppValue
+                tt = isa(tt,Expr) ? tt.args[2] : tt.parameters[1]
             end
-            T = CppPtr{tt,CVR}
+            xT = quoted ? :(CppPtr{$tt,$CVR}) : CppPtr{tt, CVR}
             # As a special case, if we're returning a jl_value_t *, interpret it
             # as a julia type.
-            if T == pcpp"jl_value_t"
-                return Any
+            if !quoted && xT == pcpp"jl_value_t"
+                return quoted ? :(Any) : Any
             end
-            return T
+            return xT
         else
-            return Ptr{tt}
+            return quoted ? :(Ptr{$tt}) : Ptr{tt}
         end
     elseif isFunctionPointerType(t)
         error("Is Function Pointer")
@@ -543,7 +527,7 @@ function juliatype(t::QualType, quoted = false, typeargs = Dict{Int,Void}();
     elseif isEnumeralType(t)
         T = juliatype(getUnderlyingTypeOfEnum(t))
         if !isAnonymous(t)
-            T = CppEnum{symbol(get_name(t)),T}
+            T = CppEnum{Symbol(get_name(t)),T}
         end
     elseif isIntegerType(t)
         kind = builtinKind(t)
@@ -564,6 +548,7 @@ function juliatype(t::QualType, quoted = false, typeargs = Dict{Int,Void}();
         elseif kind == cSChar
             T = Int8
         else
+            ccall(:jl_,Void,(Any,),kind)
             dump(t)
             error("Unrecognized Integer type")
         end
@@ -595,7 +580,7 @@ function juliatype(t::QualType, quoted = false, typeargs = Dict{Int,Void}();
         t = pcpp"clang::TemplateSpecializationType"(convert(Ptr{Void},t))
         TD = getUnderlyingTemplateDecl(t)
         TDargs = getTemplateParameters(t,quoted,typeargs)
-        T = CppBaseType{symbol(get_name(TD))}
+        T = CppBaseType{Symbol(get_name(TD))}
         if quoted
             exprT = :(CppTemplate{$T,$TDargs})
             valuecvr && (exprT = :(CxxQualType{$exprT,$CVR}))

@@ -78,13 +78,6 @@ immutable CxxArrayType{T}
 end
 
 # The equivalent of a C++ on-stack value.
-# The representation of this is important and subject to change.
-# The current implementation is inefficient, because it puts the object on the
-# heap (ouch). A better implementation would use fixed-size arrays, ideally
-# coupled with the necessary escape analysis to be able to put it on the stack
-# in the common case. However, this will require (planned, but not yet
-# implemented) improvements in core Julia.
-#
 # T is a CppBaseType or a CppTemplate
 # See note on CVR above
 type CppValue{T,N}
@@ -95,13 +88,12 @@ end
 
 # The equivalent of a C++ reference
 # T can be any valid C++ type other than CppRef
-# See note on CVR above
-immutable CppRef{T,CVR}
-    ptr::Ptr{Void}
-end
+# See note on CVR above and note on bitstype below
+bitstype 8*sizeof(Ptr{Void}) CppRef{T,CVR}
+(::Type{CppRef{T,CVR}}){T,CVR}(p::Ptr{Void}) = reinterpret(CppRef{T,CVR}, p)
 
-cconvert(::Type{Ptr{Void}},p::CppRef) = p.ptr
-Base.unsafe_load{T<:Union{CxxBuiltinTs,Ptr}}(p::CppRef{T}) = unsafe_load(convert(Ptr{T},p.ptr))
+cconvert(::Type{Ptr{Void}},p::CppRef) = reinterpret(Ptr{Void}, p)
+Base.unsafe_load{T<:Union{CxxBuiltinTs,Ptr}}(p::CppRef{T}) = unsafe_load(reinterpret(Ptr{T}, p))
 Base.convert{T<:CxxBuiltinTs}(::Type{T},p::CppRef{T}) = unsafe_load(p)
 
 # The equivalent of a C++ pointer.
@@ -117,10 +109,13 @@ bitstype 8*sizeof(Ptr{Void}) CppPtr{T,CVR}
 
 cconvert(::Type{Ptr{Void}},p::CppPtr) = reinterpret(Ptr{Void}, p)
 Base.convert(::Type{Int},p::CppPtr) = convert(Int,reinterpret(Ptr{Void}, p))
+Base.convert(::Type{UInt},p::CppPtr) = convert(UInt,reinterpret(Ptr{Void}, p))
 Base.convert(::Type{Ptr{Void}},p::CppPtr) = reinterpret(Ptr{Void}, p)
 
 ==(p1::CppPtr,p2::Ptr) = convert(Ptr{Void}, p1) == p2
 ==(p1::Ptr,p2::CppPtr) = p1 == convert(Ptr{Void}, p2)
+
+Base.unsafe_load{T<:CppPtr}(p::CppRef{T}) = unsafe_load(reinterpret(Ptr{T}, p))
 
 # Provides a common type for CppFptr and CppMFptr
 immutable CppFunc{rt, argt}; end
@@ -145,7 +140,7 @@ end
 ==(p1::CppEnum,p2::Integer) = p1.val == p2
 ==(p1::Integer,p2::CppEnum) = p1 == p2.val
 
-Base.unsafe_load{T<:CppEnum}(p::CppRef{T}) = unsafe_load(convert(Ptr{Cint},p.ptr))
+Base.unsafe_load{T<:CppEnum}(p::CppRef{T}) = unsafe_load(reinterpret(Ptr{Cint}, p))
 
 # Representa a C++ Lambda. Since they are not nameable, we need to number them
 # and record the corresponding type
@@ -171,7 +166,7 @@ typeForLambda{N}(::Type{CppLambda{N}}) = lambdaTypes[N]
 # etc.
 
 const NullCVR = (false,false,false)
-simpleCppType(s) = CppBaseType{symbol(s)}
+simpleCppType(s) = CppBaseType{Symbol(s)}
 simpleCppValue(s) = CxxQualType{simpleCppType(s),NullCVR}
 
 macro pcpp_str(s,args...)

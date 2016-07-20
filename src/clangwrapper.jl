@@ -25,6 +25,9 @@ function extractCVR(T::QualType)
     quals = ccall((:extractCVR,libcxxffi),Cuint,(Ptr{Void},),T)
     ((quals&0x1)!=0,(quals&0x2)!=0,(quals&0x4)!=0)
 end
+function constQualified(T::QualType)
+    QualType(UInt(T.ptr) | 0x1)
+end
 
 # Pass a qual type via the opaque pointer
 cconvert(::Type{Ptr{Void}},p::QualType) = p.ptr
@@ -57,7 +60,7 @@ function _lookup_name(C,fname::AbstractString, ctx::pcpp"clang::DeclContext")
     #end
     pcpp"clang::Decl"(
         ccall((:lookup_name,libcxxffi),Ptr{Void},
-            (Ptr{ClangCompiler},Ptr{UInt8},Ptr{Void}),&C,bytestring(fname),ctx))
+            (Ptr{ClangCompiler},Cstring,Ptr{Void}),&C,string(fname),ctx))
 end
 _lookup_name(C,fname::Symbol, ctx::pcpp"clang::DeclContext") = _lookup_name(C,string(fname),ctx)
 
@@ -79,12 +82,17 @@ function CreateDeclRefExpr(C, p; cxxscope=C_NULL, islvalue=true)
     CreateDeclRefExpr(C, vd;islvalue=islvalue,cxxscope=cxxscope)
 end
 
-cptrarr(a) = [convert(Ptr{Void}, x) for x in a]
+function EmitDeclRef(C, DRE)
+    pcpp"llvm::Value"(ccall((:EmitDeclRef, libcxxffi), Ptr{Void},
+        (Ptr{ClangCompiler}, Ptr{Void}), &C, DRE))
+end
 
-function CreateParmVarDecl(C, p::QualType,name="dummy")
+cptrarr(a) = Ptr{Void}[convert(Ptr{Void}, x) for x in a]
+
+function CreateParmVarDecl(C, p::QualType,name="dummy"; used = true)
     pcpp"clang::ParmVarDecl"(
         ccall((:CreateParmVarDecl,libcxxffi),Ptr{Void},
-            (Ptr{ClangCompiler},Ptr{Void},Ptr{UInt8}),&C,p,name))
+            (Ptr{ClangCompiler},Ptr{Void},Ptr{UInt8},Cint),&C,p,name,used))
 end
 
 function CreateVarDecl(C, DC::pcpp"clang::DeclContext",name,T::QualType)
@@ -206,6 +214,12 @@ CreateRetVoid(builder) =
 
 CreateBitCast(builder,val,ty) =
     pcpp"llvm::Value"(ccall((:CreateBitCast,libcxxffi),Ptr{Void},(Ptr{Void},Ptr{Void},Ptr{Void}),builder,val,ty))
+
+CreateZext(builder,val,ty) =
+    pcpp"llvm::Value"(ccall((:CreateZext,libcxxffi),Ptr{Void},(Ptr{Void},Ptr{Void},Ptr{Void}),builder,val,ty))
+
+CreateTrunc(builder,val,ty) =
+    pcpp"llvm::Value"(ccall((:CreateTrunc,libcxxffi),Ptr{Void},(Ptr{Void},Ptr{Void},Ptr{Void}),builder,val,ty))
 
 getConstantIntToPtr(C::pcpp"llvm::Constant", ty) =
     pcpp"llvm::Constant"(ccall((:getConstantIntToPtr,libcxxffi),Ptr{Void},(Ptr{Void},Ptr{Void}),C,ty))
@@ -349,7 +363,7 @@ isIncompleteType(t::pcpp"clang::Type") = pcpp"clang::NamedDecl"(ccall((:isIncomp
 function createNamespace(C,name::AbstractString)
     pcpp"clang::NamespaceDecl"(
         ccall((:createNamespace,libcxxffi),Ptr{Void},
-            (Ptr{ClangCompiler},Ptr{UInt8}),&C,bytestring(name)))
+            (Ptr{ClangCompiler},Ptr{UInt8}),&C,string(name)))
 end
 
 function PerformMoveOrCopyInitialization(C,rt,expr)
@@ -459,8 +473,8 @@ for (rt,argt) in ((pcpp"clang::ClassTemplateSpecializationDecl",pcpp"clang::Decl
                   (pcpp"clang::CXXMethodDecl",pcpp"clang::Decl"),
                   (pcpp"clang::CXXConstructorDecl",pcpp"clang::Decl"))
     s = split(string(rt.parameters[1].parameters[1].parameters[1]),"::")[end]
-    isas = symbol(string("isa",s))
-    ds = symbol(string("dcast",s))
+    isas = Symbol(string("isa",s))
+    ds = Symbol(string("dcast",s))
     # @cxx llvm::isa{$rt}(t)
     @eval $(isas)(t::$(argt)) = ccall(($(quot(isas)),libcxxffi),Cint,(Ptr{Void},),t) != 0
     @eval $(ds)(t::$(argt)) = ($rt)(ccall(($(quot(ds)),libcxxffi),Ptr{Void},(Ptr{Void},),t))
@@ -592,13 +606,14 @@ function CreateLinkageSpec(C,DC::pcpp"clang::DeclContext",kind)
     pcpp"clang::DeclContext"(ccall((:CreateLinkageSpec,libcxxffi),Ptr{Void},(Ptr{ClangCompiler},Ptr{Void},Cuint),&C,DC,kind))
 end
 
-getName(x::pcpp"llvm::Function") = bytestring(ccall((:getLLVMValueName,libcxxffi),Ptr{UInt8},(Ptr{Void},),x))
-getName(ND::pcpp"clang::NamedDecl") = bytestring(ccall((:getNDName,libcxxffi),Ptr{UInt8},(Ptr{Void},),ND))
+getName(x::pcpp"llvm::Function") = unsafe_string(ccall((:getLLVMValueName,libcxxffi),Ptr{UInt8},(Ptr{Void},),x))
+getName(ND::pcpp"clang::NamedDecl") = unsafe_string(ccall((:getNDName,libcxxffi),Ptr{UInt8},(Ptr{Void},),ND))
 getName(ND::pcpp"clang::ParmVarDecl") = getName(pcpp"clang::NamedDecl"(convert(Ptr{Void}, ND)))
 
 getParmVarDecl(x::pcpp"clang::FunctionDecl",i) = pcpp"clang::ParmVarDecl"(ccall((:getParmVarDecl,libcxxffi),Ptr{Void},(Ptr{Void},Cuint),x,i))
 
 SetDeclUsed(C,FD) = ccall((:SetDeclUsed, libcxxffi),Void,(Ptr{ClangCompiler},Ptr{Void}),&C,FD)
+IsDeclUsed(D) = ccall((:IsDeclUsed, libcxxffi), Cint, (Ptr{Void},), D) != 0
 
 emitDestroyCXXObject(C, x, T) = ccall((:emitDestroyCXXObject, libcxxffi), Void, (Ptr{ClangCompiler},Ptr{Void},Ptr{Void}),&C,x,T)
 
@@ -706,4 +721,38 @@ end
 function getUnderlyingTypeOfEnum(T::pcpp"clang::Type")
     QualType(ccall((:getUnderlyingTypeOfEnum, libcxxffi), Ptr{Void},
         (Ptr{Void},), T))
+end
+
+function InsertIntoShadowModule(C, llvmf::pcpp"llvm::Function")
+    ccall((:InsertIntoShadowModule, libcxxffi), Void, (Ptr{ClangCompiler}, Ptr{Void},), &C, llvmf)
+end
+
+function SetVarDeclInit(D::pcpp"clang::VarDecl", init)
+    ccall((:SetVarDeclInit, libcxxffi), Void, (Ptr{Void}, Ptr{Void}), D, init)
+end
+
+function SetConstexpr(VD::pcpp"clang::VarDecl")
+    ccall((:SetVarDeclInit, libcxxffi), Void, (Ptr{Void},), VD)
+end
+
+function isCCompiler(C)
+    ccall((:isCCompiler, libcxxffi), Cint, (Ptr{ClangCompiler},), &C) != 0
+end
+
+function AddTopLevelDecl(C, D)
+    ccall((:AddTopLevelDecl, libcxxffi), Void,
+        (Ptr{ClangCompiler}, Ptr{Void}), &C, D)
+end
+
+function DeleteUnusedArguments(F, todelete)
+    pcpp"llvm::Function"(ccall((:DeleteUnusedArguments, libcxxffi), Ptr{Void},
+        (Ptr{Void}, Ptr{UInt64}, Csize_t), F, todelete, length(todelete)))
+end
+
+function getTypeNameAsString(QT)
+    ptr = ccall((:getTypeNameAsString, libcxxffi), Ptr{UInt8},
+        (Ptr{Void},), QT)
+    str = unsafe_string(ptr)
+    Libc.free(ptr)
+    str
 end
