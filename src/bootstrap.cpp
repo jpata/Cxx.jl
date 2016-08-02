@@ -1316,8 +1316,8 @@ static void set_default_clang_options(C, bool CCompiler, const char *Triple, con
         Cxx->CI->getLangOpts().CPlusPlus = 1;
         Cxx->CI->getLangOpts().CPlusPlus11 = 1;
         Cxx->CI->getLangOpts().CPlusPlus14 = 1;
-        Cxx->CI->getLangOpts().RTTI = 0;
-        Cxx->CI->getLangOpts().RTTIData = 0;
+        Cxx->CI->getLangOpts().RTTI = 1;
+        Cxx->CI->getLangOpts().RTTIData = 1;
         Cxx->CI->getLangOpts().Exceptions = 1;          // exception handling
         Cxx->CI->getLangOpts().ObjCExceptions = 1;  //  Objective-C exceptions
         Cxx->CI->getLangOpts().CXXExceptions = 1;   // C++ exceptions
@@ -1627,6 +1627,11 @@ JL_DLLEXPORT void *CreateFunctionDecl(C, void *DC, char* name, void *type, int i
     getTrivialSourceLocation(Cxx), getTrivialSourceLocation(Cxx),
       clang::DeclarationName(Cxx->CI->getPreprocessor().getIdentifierInfo(name)),
       T, Cxx->CI->getASTContext().getTrivialTypeSourceInfo(T), isextern ? clang::SC_Extern : clang::SC_None);
+
+  // check if we are compiling for a device
+  if (Cxx->CI->getLangOpts().CUDAIsDevice == 1) {
+    D->addAttr(clang::CUDADeviceAttr::CreateImplicit(Cxx->CI->getASTContext(), D->getLocation()));
+  }
   return D;
 }
 
